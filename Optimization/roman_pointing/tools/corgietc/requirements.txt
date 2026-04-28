@@ -1,0 +1,2 @@
+EXOSIMS>=3.6.5
+cgi_noise>=1.4.0
