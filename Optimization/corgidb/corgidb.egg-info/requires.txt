@@ -1,0 +1,6 @@
+EXOSIMS>=3.6.4
+SQLAlchemy
+PyMySQL
+pandas
+keyring
+numpy

@@ -1,0 +1,12 @@
+LICENSE
+README.md
+pyproject.toml
+requirements.txt
+setup.py
+corgidb/__init__.py
+corgidb/ingest.py
+corgidb.egg-info/PKG-INFO
+corgidb.egg-info/SOURCES.txt
+corgidb.egg-info/dependency_links.txt
+corgidb.egg-info/requires.txt
+corgidb.egg-info/top_level.txt
