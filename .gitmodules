@@ -1,0 +1,3 @@
+[submodule "tools/corgietc"]
+	path = tools/corgietc
+	url = https://github.com/roman-corgi/corgietc.git
