@@ -6,4 +6,10 @@ angutils>=1.0.0
 ipywidgets
 jupyterlab
 matplotlib
+pandas>=1.3.0
+httpx>=0.24.0
+scikit-learn>=1.0.0
+# PyTorch (CPU): pip install torch torchvision torchaudio
+# PyTorch (CUDA 12.4, recommended for GPU): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch>=2.0.0
 
