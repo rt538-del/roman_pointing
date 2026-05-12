@@ -1,13 +1,9 @@
 """
-Reference Star Selection Tool — ML-Accelerated (CS 6787 Final Project)
-=======================================================================
 A shallow PyTorch neural network learns to predict which candidate reference
 stars will pass the Roman Space Telescope solar/pitch angle constraints.
 The classifier pre-filters the candidate list so that the expensive
 compute_roman_angles physics check runs on far fewer stars.
 
-CS 6787 techniques — all applied DIRECTLY to neural network training
----------------------------------------------------------------------
 1. DATA PARALLELISM   — multi-worker DataLoader (num_workers > 1) parallelises
                         batch assembly across CPU cores during training, exactly
                         mirroring the MapReduce map-phase (Lecture 7, Paper 6a).
@@ -24,6 +20,7 @@ CS 6787 techniques — all applied DIRECTLY to neural network training
 """
 
 import asyncio
+import platform
 import queue
 import threading
 import time
@@ -101,14 +98,16 @@ DIAMETER_COLS = ["st_uddv", "st_uddi", "st_uddmeas", "st_lddmeas"]
 
 # Neural network feature columns (all available at filter time)
 FEATURE_COLS = ["ra", "dec", "sy_vmag", "sy_imag", "sy_plx", "sy_pmra", "sy_pmdec"]
-N_FEATURES   = len(FEATURE_COLS) + 3   # +3: sci_ra, sci_dec, win_duration
+BAND_ID      = {"1w": 0, 1: 1, 3: 2, 4: 3}
+# +sci_ra, +sci_dec, +win_duration, +band_id, +ang_sep_deg, +ecl_lat_deg, +ecl_lon_deg
+N_FEATURES   = len(FEATURE_COLS) + 7
 
 
 def _safe_float(v):
     """Convert value to float, returning None on failure or NaN."""
     if v is None:
         return None
-    try:
+    try:    
         r = float(v)
         return None if np.isnan(r) else r
     except (TypeError, ValueError):
@@ -150,7 +149,6 @@ def load_catalog(
     force_refresh: bool = False,
 ) -> pd.DataFrame:
     """Load catalog from cache or live URL."""
-    import requests
     resolved = Path(cache_path) if cache_path else DEFAULT_CACHE_PATH
 
     def _fresh():
@@ -158,12 +156,12 @@ def load_catalog(
                 time.time() - resolved.stat().st_mtime < max_cache_age_hours * 3600)
 
     if not force_refresh and _fresh():
-        print(f"Loading catalog from cache ({resolved.name})...")
+        print(f"Loading catalog from cache ({resolved.name})...", flush=True)
         return pd.read_csv(resolved, low_memory=False)
 
-    print(f"Fetching catalog from {url} ...")
+    print(f"Fetching catalog from {url} ...", flush=True)
     try:
-        resp = requests.get(
+        resp = httpx.get(
             url, headers={"User-Agent": "RomanRefStarPicker/1.0"}, timeout=30
         )
         resp.raise_for_status()
@@ -253,10 +251,6 @@ def get_science_mag(sci_name: str, band, catalog: pd.DataFrame) -> Optional[floa
         return _safe_float(match.iloc[0].get(mag_col))
     return None
 
-
-# =============================================================================
-# ASTRONOMY HELPERS (module-level so workers can pickle them)
-# =============================================================================
 
 def _build_skycoord(star) -> c.SkyCoord:
     """Build a BarycentricMeanEcliptic SkyCoord from a catalog row or dict."""
@@ -415,27 +409,58 @@ def extract_features(
     sci_ra: float,
     sci_dec: float,
     win_duration: float,
+    band=None,
 ) -> np.ndarray:
     """
     Return float32 feature matrix shape (N_candidates, N_FEATURES).
     Missing values filled with column medians — all vectorised, no per-row loop.
+
+    Derived geometry features are included explicitly so the model doesn't have
+    to learn angular arithmetic from raw RA/Dec:
+      ang_sep_deg : great-circle separation between sci and ref star
+      ecl_lat_deg : ecliptic latitude of ref star (governs solar-angle keepout)
+      ecl_lon_deg : ecliptic longitude of ref star
     """
     X = candidates_df[FEATURE_COLS].copy()
     X = X.fillna(X.median())   # vectorised NaN fill
 
     n = len(X)
+    ref_ra  = X["ra"].values.astype(np.float64)
+    ref_dec = X["dec"].values.astype(np.float64)
+
+    # Angular separation (haversine, degrees)
+    d_ra  = np.radians(ref_ra - sci_ra)
+    d_dec = np.radians(ref_dec - sci_dec)
+    a     = (np.sin(d_dec / 2) ** 2
+             + np.cos(np.radians(sci_dec)) * np.cos(np.radians(ref_dec))
+             * np.sin(d_ra / 2) ** 2)
+    ang_sep = np.degrees(2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))).astype(np.float32)
+
+    # Ecliptic coordinates of ref star (epoch J2000, obliquity ~23.44 deg)
+    eps    = np.radians(23.4392911)
+    ra_r   = np.radians(ref_ra)
+    dec_r  = np.radians(ref_dec)
+    sin_ecl_lat = (np.sin(dec_r) * np.cos(eps)
+                   - np.cos(dec_r) * np.sin(eps) * np.sin(ra_r))
+    ecl_lat = np.degrees(np.arcsin(np.clip(sin_ecl_lat, -1, 1))).astype(np.float32)
+    ecl_lon = np.degrees(np.arctan2(
+        np.sin(ra_r) * np.cos(eps) + np.tan(dec_r) * np.sin(eps),
+        np.cos(ra_r),
+    )).astype(np.float32)
+
     sci_ctx = np.column_stack([
-        np.full(n, sci_ra,       dtype=np.float32),
-        np.full(n, sci_dec,      dtype=np.float32),
-        np.full(n, win_duration, dtype=np.float32),
+        np.full(n, sci_ra,                          dtype=np.float32),
+        np.full(n, sci_dec,                         dtype=np.float32),
+        np.full(n, win_duration,                    dtype=np.float32),
+        np.full(n, float(BAND_ID.get(band, 0)),     dtype=np.float32),
+        ang_sep,
+        ecl_lat,
+        ecl_lon,
     ])
     # OPTIMISATION 3: float32 immediately
     return np.hstack([X.values.astype(np.float32), sci_ctx])
 
-
-
 # NEURAL NETWORK MODEL
-
 class RefStarClassifier(nn.Module):
     """
     Shallow MLP: (N_FEATURES,) → logit (pass probability pre-sigmoid).
@@ -461,12 +486,10 @@ class RefStarClassifier(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-# =============================================================================
 # OPTIMISATION 2 — ASYNC BATCH PREFETCHER
 # Background thread prepares the next batch while the GPU runs the current one,
 # eliminating CPU-idle stalls in the training loop.
 # Analogous to async gradient communication in Dean et al. 2012 (Paper 8a).
-# =============================================================================
 
 class AsyncPrefetcher:
     """Wraps a DataLoader; prefetches the next batch in a background thread."""
@@ -512,7 +535,7 @@ def train_classifier(
     num_workers:           int   = 4,
     use_amp:               bool  = True,
     random_seed:           int   = 42,
-    threshold_safety_margin: float = 0.05,  # subtract from min-positive score for recall safety
+    target_recall:         float = 0.99,   # recall target for threshold calibration
     return_history:        bool  = False,
 ) -> tuple:
     """
@@ -539,7 +562,11 @@ def train_classifier(
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = use_amp and device.type == "cuda"
-    print(f"  Device={device} | AMP={'on' if amp_enabled else 'off'} | workers={num_workers}")
+    # On Windows, use persistent_workers so processes spawn once and stay alive
+    # across all epochs — eliminating per-epoch spawn overhead.
+    persistent = (platform.system() == "Windows" and num_workers > 0)
+    print(f"  Device={device} | AMP={'on' if amp_enabled else 'off'} | workers={num_workers}"
+          f" | persistent={persistent}")
 
     # OPTIMISATION 1: parallel batch assembly across CPU cores
     loader = DataLoader(
@@ -548,6 +575,7 @@ def train_classifier(
         shuffle=True,
         num_workers=num_workers,          # <-- Opt 1
         pin_memory=(device.type == "cuda"),
+        persistent_workers=persistent,
     )
 
     model     = RefStarClassifier(n_features=X.shape[1]).to(device)
@@ -577,7 +605,6 @@ def train_classifier(
             print(f"  Epoch {epoch+1}/{n_epochs}  loss={mean_loss:.4f}")
 
     # Recall-safe threshold calibration
-    #
     # Score ALL examples (train + val) to find the global minimum positive
     # score. Using only the val split risks missing low-scoring positives
     # that appear at inference time. We then subtract threshold_safety_margin
@@ -599,12 +626,12 @@ def train_classifier(
             val_scores = torch.sigmoid(model(X_val.to(device))).cpu().numpy()
     y_val_np = y_val.numpy()
 
-    # Threshold = min positive score on val set → guarantees recall=1.0 on held-out data.
-    # Using the all-examples min caused threshold to floor to 0.0 whenever any training
-    # positive scored < safety_margin (model uncertainty on a few edge cases).
+    # Threshold calibrated to target_recall on the val set.
+    # We set threshold = (1 - target_recall) percentile of val positive scores,
+    # so at most (1 - target_recall) fraction of positives fall below it.
     pos_scores_val_only = val_scores[y_val_np == 1]
-    raw_threshold = float(np.min(pos_scores_val_only)) if len(pos_scores_val_only) else 0.0
-    threshold = raw_threshold
+    miss_pct = (1.0 - target_recall) * 100.0   # e.g. 1.0 for 99% recall
+    threshold = float(np.percentile(pos_scores_val_only, miss_pct)) if len(pos_scores_val_only) else 0.0
 
     val_preds   = (val_scores >= threshold).astype(int)
     val_recall  = (np.sum((val_preds == 1) & (y_val_np == 1)) /
@@ -612,7 +639,8 @@ def train_classifier(
     val_tn_rate = (np.sum((val_preds == 0) & (y_val_np == 0)) /
                    max(1, np.sum(y_val_np == 0)))
 
-    print(f"  Val min-pos score={raw_threshold:.4f} (no safety margin subtracted)")
+    print(f"  Target recall={target_recall:.2%} → threshold={threshold:.4f} "
+          f"(val positive {miss_pct:.1f}th percentile)")
     print(f"  Final threshold={threshold:.4f} | val recall={val_recall:.3f} "
           f"| TN-filter-rate={val_tn_rate:.3f}")
     if len(pos_scores_all) and len(neg_scores_all):
@@ -685,7 +713,7 @@ def _generate_labels_worker(args):
             # OPTIMISATION 4: vectorised feature matrix for all candidates
             cands_df = pd.DataFrame(ref_data_rows)
             X_cands  = extract_features(
-                cands_df, float(icrs.ra.deg), float(icrs.dec.deg), float(win_dur)
+                cands_df, float(icrs.ra.deg), float(icrs.dec.deg), float(win_dur), band
             )
 
             for idx_c, rd in enumerate(ref_data_rows):
@@ -710,7 +738,7 @@ def generate_training_data(
     science_targets: list,
     analysis_start:  str,
     analysis_days:   float,
-    band,
+    bands,
     catalog:         pd.DataFrame,
     allowed_grades:  list = None,
     max_pitch_diff:  float = MAX_PITCH_DIFF,
@@ -718,48 +746,53 @@ def generate_training_data(
     n_workers:       int   = None,
 ) -> list:
     """
-    Generate labeled training examples in parallel across science targets.
+    Generate labeled training examples in parallel across science targets and bands.
     OPTIMISATION 1: ProcessPoolExecutor — each target is an independent map job.
+    Loops over all requested bands so the model trains on multi-band signal.
     """
+    if not isinstance(bands, (list, tuple)):
+        bands = [bands]
     active_grades = [g for g in (allowed_grades or REF_GRADES) if g in REF_GRADES]
-    try:
-        cands = _filter_candidates(catalog, band, "high", active_grades)
-    except ValueError:
-        cands = catalog.copy()
-
-    ref_data_rows = [
-        row.to_dict() for _, row in cands.iterrows()
-        if isinstance(row.get("main_id"), str)
-        and row["main_id"].strip() not in SKIP_NAMES
-    ]
-
-    print(f"Generating data for {len(science_targets)} target(s) "
-          f"| {len(ref_data_rows)} ref candidates | pitch<={max_pitch_diff} deg")
-
-    worker_args = [
-        (sci, analysis_start, analysis_days, band,
-         ref_data_rows, max_pitch_diff, time_step)
-        for sci in science_targets
-    ]
 
     all_examples = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {
-            pool.submit(_generate_labels_worker, a): a[0]
-            for a in worker_args
-        }
-        for fut in as_completed(futures):
-            sci = futures[fut]
-            try:
-                examples = fut.result()
-                all_examples.extend(examples)
-                pos = sum(e["label"] for e in examples)
-                print(f"  {sci}: {len(examples)} examples ({pos} positive)")
-            except Exception as exc:
-                print(f"  {sci}: FAILED — {exc}")
+    for band in bands:
+        try:
+            cands = _filter_candidates(catalog, band, "high", active_grades)
+        except ValueError:
+            cands = catalog.copy()
+
+        ref_data_rows = [
+            row.to_dict() for _, row in cands.iterrows()
+            if isinstance(row.get("main_id"), str)
+            and row["main_id"].strip() not in SKIP_NAMES
+        ]
+
+        print(f"\n[Band {band}] {len(science_targets)} targets "
+              f"| {len(ref_data_rows)} ref candidates | pitch<={max_pitch_diff} deg")
+
+        worker_args = [
+            (sci, analysis_start, analysis_days, band,
+             ref_data_rows, max_pitch_diff, time_step)
+            for sci in science_targets
+        ]
+
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_generate_labels_worker, a): a[0]
+                for a in worker_args
+            }
+            for fut in as_completed(futures):
+                sci = futures[fut]
+                try:
+                    examples = fut.result()
+                    all_examples.extend(examples)
+                    pos = sum(e["label"] for e in examples)
+                    print(f"  {sci}: {len(examples)} examples ({pos} positive)")
+                except Exception as exc:
+                    print(f"  {sci}: FAILED — {exc}")
 
     pos_total = sum(e["label"] for e in all_examples)
-    print(f"Total: {len(all_examples)} examples | "
+    print(f"\nTotal across all bands: {len(all_examples)} examples | "
           f"{pos_total} positive | {len(all_examples)-pos_total} negative")
     return all_examples
 
@@ -852,12 +885,17 @@ def scan_for_valid_target(
             min_pdiff_seen = 999.0
             n_solar_ok     = 0
 
-            for win_start, win_end, ws, we, wd in windows:
+            for win_idx_s, (win_start, win_end, ws, we, wd) in enumerate(windows):
                 si  = int((win_start.mjd - times[0].mjd) / time_step)
                 ei  = min(si + int(wd) + 1, len(sci_pitch_vals))
                 spw = sci_pitch_vals[si:ei]
+                print(f"      window {win_idx_s+1}/{len(windows)}: "
+                      f"{ws[:10]} → {we[:10]}  ({int(wd)}d)  "
+                      f"checking {len(cands)} candidates ...", flush=True)
 
-                for _, ref in cands.iterrows():
+                for ci, (_, ref) in enumerate(cands.iterrows()):
+                    if ci % 100 == 0 and ci > 0:
+                        print(f"        ... {ci}/{len(cands)} candidates done", flush=True)
                     name = ref.get("main_id", "")
                     if not isinstance(name, str) or name.strip() in SKIP_NAMES:
                         continue
@@ -900,10 +938,6 @@ def scan_for_valid_target(
 
     return None
 
-
-# =============================================================================
-# MAIN SELECTION FUNCTION
-# =============================================================================
 
 def select_ref_star(
     sci_name:       str,
@@ -993,7 +1027,7 @@ def select_ref_star(
         # OPTIMISATION 4: vectorised feature extraction, all candidates at once
         X         = extract_features(
             pd.DataFrame(ref_data_rows),
-            float(icrs.ra.deg), float(icrs.dec.deg), windows[0][4]
+            float(icrs.ra.deg), float(icrs.dec.deg), windows[0][4], band
         )
         keep_mask     = classify_candidates(classifier, clf_threshold, X, use_amp)
         ref_data_rows = [rd for rd, k in zip(ref_data_rows, keep_mask) if k]
@@ -1022,7 +1056,11 @@ def select_ref_star(
         valid_refs   = []
         pitch_series = {}
 
-        for rd in ref_data_rows:
+        print(f"  Window {win_idx+1}/{len(windows)}: physics check on "
+              f"{len(ref_data_rows)} candidate(s) ...", flush=True)
+        for ri, rd in enumerate(ref_data_rows):
+            if ri % 100 == 0 and ri > 0:
+                print(f"    ... {ri}/{len(ref_data_rows)} done", flush=True)
             ref_name = rd["main_id"]
             try:
                 passes, n_valid, min_pd, pd_series, valid_mask = _check_one_star(
@@ -1173,7 +1211,7 @@ def _select_one_target_worker(args):
             sb     = {r["reference_star"] for r in wb["valid_refs"]}
             sm     = {r["reference_star"] for r in wm["valid_refs"]}
             missed = sb - sm
-            ok     = not missed
+            ok     = len(missed) / max(1, len(sb)) <= 0.01  # ≤1% miss acceptable at 99% recall target
             all_ok = all_ok and ok
             per_win.append({
                 "baseline_stars": len(sb),
@@ -1275,7 +1313,7 @@ def run_multi_target(
                 if res.get("error") is not None:
                     print(f"  {sci}: ERROR — {res['error']}")
                 else:
-                    recall_str = "RECALL=1.0" if res.get("recall_ok", False) else "RECALL<1.0 !"
+                    recall_str = "RECALL≥99%" if res.get("recall_ok", False) else "RECALL<99% !"
                     print(
                         f"  {sci}: baseline={res['base_time']:.2f}s "
                         f"| ML={res['ml_time']:.2f}s "
@@ -1334,6 +1372,13 @@ def print_multi_target_summary(results: list):
 
 
 # EFFICIENCY EXPERIMENTS & VISUALISATION  (CS 6787 Final Project)
+
+
+def save_plot(fig, filename: str):
+    PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = PLOT_OUTPUT_DIR / filename
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"  Plot saved to {out_path}")
 
 
 def plot_statistical_efficiency(
@@ -1610,13 +1655,18 @@ def benchmark_data_parallelism(
     n_samples = len(X)
     device    = torch.device("cpu")  # scaling test runs on CPU for reproducibility
 
+    is_win = platform.system() == "Windows"
+
     records = []
     for nw in worker_counts:
         torch.manual_seed(random_seed)
         np.random.seed(random_seed)
+        # On Windows use persistent_workers so spawn happens once, not per epoch
+        persistent = is_win and nw > 0
         loader = DataLoader(
             TensorDataset(torch.from_numpy(X), torch.from_numpy(y)),
-            batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=False,
+            batch_size=batch_size, shuffle=True, num_workers=nw,
+            pin_memory=False, persistent_workers=persistent,
         )
         m   = RefStarClassifier(n_features=X.shape[1]).to(device)
         opt = optim.Adam(m.parameters(), lr=1e-3)
@@ -1630,8 +1680,9 @@ def benchmark_data_parallelism(
                 opt.step()
         elapsed = time.perf_counter() - t0
         tput = (n_samples * n_epochs) / elapsed
-        records.append({"workers": nw, "time_s": elapsed, "throughput": tput})
-        print(f"  workers={nw:2d}: {elapsed:.2f}s  ({tput:.0f} samples/s)")
+        records.append({"workers": nw, "time_s": elapsed, "throughput": tput,
+                        "persistent": persistent})
+        print(f"  workers={nw:2d} persistent={persistent}: {elapsed:.2f}s  ({tput:.0f} samples/s)")
 
     workers     = [r["workers"]    for r in records]
     throughputs = [r["throughput"] for r in records]
@@ -1641,7 +1692,6 @@ def benchmark_data_parallelism(
     base_w = max(workers[0], 1)
     ideal  = [max(w, 1) / base_w for w in workers]
 
-    import platform
     is_windows  = platform.system() == "Windows"
     non_zero_tp = [tp for w, tp in zip(workers, throughputs) if w > 0]
     has_outlier = (
@@ -1705,10 +1755,11 @@ def benchmark_data_parallelism(
                 f"[workers=0 ref: {throughputs[0]:.0f} samp/s  off scale, {ratio:.0f}x faster]"
             )
             ax.grid(True, axis="y", alpha=0.3)
-            ax.annotate(
-                f"Windows process-spawn overhead:\nworkers=0 is {ratio:.0f}x faster than\n"
-                "any multi-worker setting (no fork on Windows)",
-                xy=(0.97, 0.95), xycoords="axes fraction", ha="right", va="top",
+            ax.text(
+                0.97, 0.95,
+                f"workers=0 ref: {throughputs[0]:.0f} samp/s\n"
+                f"({ratio:.0f}× faster — no spawn overhead)",
+                transform=ax.transAxes, ha="right", va="top",
                 fontsize=8, color="firebrick",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow",
                           edgecolor="firebrick", alpha=0.9),
@@ -1729,13 +1780,11 @@ def benchmark_data_parallelism(
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
         if is_windows:
-            ax.annotate(
-                "On Windows, DataLoader parallelism (num_workers > 0) degrades\n"
-                "throughput by ~30× due to process-spawn overhead — an OS-level\n"
-                "constraint absent on Linux/macOS where fork-based workers scale\n"
-                "linearly. We therefore fix num_workers=0 for all Windows benchmarks.",
-                xy=(0.5, 0.97), xycoords="axes fraction",
-                ha="center", va="top", fontsize=8, color="firebrick",
+            ax.text(
+                0.5, 0.04,
+                "workers=0 fastest on Windows\n(no process spawn overhead)",
+                transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=8, color="firebrick",
                 bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow",
                           edgecolor="firebrick", alpha=0.9),
             )
@@ -1743,14 +1792,6 @@ def benchmark_data_parallelism(
         plt.tight_layout()
         save_plot(fig, "data_parallelism_scaling.png")
         plt.show()
-
-    if is_windows:
-        print(
-            "\n  [Note] On Windows, DataLoader parallelism (num_workers > 0) degrades "
-            "throughput by ~30x due to process-spawn overhead -- an OS-level constraint "
-            "absent on Linux/macOS where fork-based workers scale linearly. "
-            "We therefore fix num_workers=0 for all Windows benchmarks."
-        )
     return records
 
 
@@ -1865,14 +1906,8 @@ def benchmark_amp_vs_fp32(
     return records
 
 
-def save_plot(fig, filename: str):
-    PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = PLOT_OUTPUT_DIR / filename
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    print(f"  Plot saved to {out_path}")
-
-
 if __name__ == "__main__":
+    print("=== ML_multiple_targets starting (imports done) ===", flush=True)
 
     TRAINING_TARGETS = [
         # --- original 25 ---
@@ -1881,6 +1916,7 @@ if __name__ == "__main__":
         "HD 190360", "HD 160691", "HD 219134", "HD 154345", "14 Her",
         "ups And", "HD 217107", "HD 100546", "HD 39091", "psi 1 Dra B",
         "HD 145675", "bet Pic", "HD 114613", "HD 192310", "HD 134987",
+        "HD 87883", "HD 114783", "* pi. Men",   # for_rifah targets
         # --- batch 2: 25 ---
         "51 Peg",       # first confirmed exoplanet host
         "rho CrB",      # first RV planet — HD 143761
@@ -1958,12 +1994,167 @@ if __name__ == "__main__":
         "Kepler-186",   # first HZ Earth-size planet
         "Kepler-442",   # best-ranked HZ super-Earth
         "Kepler-452",   # Earth-size in HZ (Earth 2.0)
+        # --- batch 4: 50 additional bright RV hosts ---
+        "HD 75289",     # hot Jupiter, V=6.4
+        "HD 210277",    # eccentric Jupiter, V=6.5
+        "HD 92788",     # Saturn-mass planet, V=7.3
+        "bet Gem",      # Pollux — giant planet, V=1.1
+        "HD 8574",      # Jupiter analog, V=7.1
+        "HD 89307",     # Jupiter analog, V=7.0
+        "HD 33636",     # eccentric Jupiter, V=6.9
+        "HD 108874",    # 2 giant planets, V=8.8
+        "HD 114729",    # Jupiter analog, V=6.7
+        "HD 196885",    # planet + stellar companion, V=6.4
+        "HD 30562",     # eccentric Jupiter, V=5.8
+        "HD 155358",    # 2 planets in HZ, V=7.2
+        "HD 11964",     # 2 planets, V=6.4
+        "HD 190228",    # eccentric giant, V=7.3
+        "HD 4208",      # Saturn analog, V=7.8
+        "HD 23127",     # eccentric giant, V=8.6
+        "HD 5319",      # 2 giants in resonance, V=8.0
+        "HD 207832",    # 2 giant planets, V=7.7
+        "HD 142415",    # hot Jupiter, V=7.3
+        "HD 108147",    # hot Jupiter, V=7.0
+        "HD 43691",     # hot Jupiter, V=8.0
+        "HD 185269",    # inflated hot Jupiter, V=6.7
+        "HD 102195",    # hot Jupiter M-dwarf, V=8.1
+        "HD 86081",     # hot Jupiter, V=7.8
+        "HD 68988",     # hot Jupiter, V=7.8
+        "HD 149143",    # hot Jupiter, V=7.9
+        "HD 73534",     # Jupiter beyond HZ, V=8.2
+        "HD 126614",    # Jupiter with brown dwarf, V=8.8
+        "HD 16175",     # eccentric giant, V=7.3
+        "HD 231701",    # warm Jupiter, V=8.1
+        "GJ 15 A",      # super-Earth, nearby M-dwarf
+        "GJ 86",        # hot Jupiter around K-dwarf
+        "GJ 328",       # long-period Jupiter M-dwarf
+        "GJ 676 A",     # 4 planets, M-dwarf
+        "GJ 179",       # cold Jupiter M-dwarf
+        "GJ 422",       # super-Earth M-dwarf
+        "GJ 480",       # super-Earth M-dwarf
+        "HD 171028",    # eccentric giant, V=8.3
+        "HD 224693",    # hot Jupiter, V=8.2
+        "HD 47186",     # 2 planets, V=7.6
+        "HD 148427",    # Saturn-mass planet, V=6.9
+        "HD 16760",     # near-brown-dwarf companion, V=8.9
+        "HD 98649",     # long-period giant, V=7.2
+        "HD 142022",    # eccentric giant, V=7.7
+        "HD 188015",    # Jupiter analog, V=8.7
+        "HD 20367",     # Jupiter analog, V=6.4
+        "HD 6434",      # hot Jupiter, V=7.7
+        "HD 65216",     # Jupiter analog, V=7.9
+        "HD 216770",    # Saturn-mass planet, V=8.1
+        "HD 114386",    # eccentric Jupiter, V=8.7
+        # --- batch 5: 100 additional systems ---
+        # bright giant-planet hosts around evolved stars
+        "iota Dra",     # V=3.3 giant planet around K-giant
+        "eps Tau",      # V=3.5 giant planet in Hyades
+        "7 CMa",        # V=3.9 giant planet
+        "91 Aqr",       # V=4.2 giant planet around giant
+        "42 Dra",       # V=4.8 giant planet
+        "70 Vir",       # V=5.0 Saturn-mass, classic RV target
+        "14 And",       # V=5.2 giant planet around giant
+        "nu Phe",       # V=5.0 giant planet
+        "18 Del",       # V=5.5 giant around subgiant
+        "6 Lyn",        # V=5.9 giant planet
+        "xi Aql",       # V=4.7 giant planet around giant
+        "24 Sex",       # V=6.4 2 giants near 1:2 MMR
+        # bright nearby RV hosts
+        "tau Boo",      # V=4.5 hot Jupiter, tidal lock candidate
+        "HD 3651",      # V=5.9 Saturn-mass companion
+        "HD 19994",     # V=5.1 eccentric giant
+        "HD 104985",    # V=5.5 giant around subgiant
+        "HD 59686",     # V=5.5 giant planet in binary
+        "HD 147513",    # V=5.4 Saturn-mass
+        "HD 156846",    # V=6.5 highly eccentric giant
+        "HD 219077",    # V=6.1 eccentric giant
+        "HD 173416",    # V=6.1 giant planet around giant
+        "HD 200964",    # V=6.7 2 giants near MMR
+        "HD 213240",    # V=6.8 eccentric giant
+        "HD 42618",     # V=6.8 Jupiter analog
+        "HD 50554",     # V=6.8 eccentric giant
+        "HD 154577",    # V=6.6 super-Earth
+        "HD 169830",    # V=5.9 2 eccentric giants
+        "HD 179079",    # V=6.9 super-Earth
+        "HD 136118",    # V=6.9 giant
+        "HD 139357",    # V=7.0 giant
+        "HD 150706",    # V=7.0 giant
+        # V=7-8 RV hosts
+        "HD 9446",      # 2 giant planets
+        "HD 11506",     # Jupiter analog, V=7.4
+        "HD 13808",     # 2 planets, V=7.5
+        "HD 16141",     # planet b, V=6.8
+        "HD 16417",     # planet b, V=7.5
+        "HD 17156",     # transiting eccentric Jupiter, V=8.2
+        "HD 20782",     # very eccentric giant, V=7.4
+        "HD 23079",     # long-period giant, V=7.1
+        "HD 27894",     # 3 planets, V=9.4
+        "HD 37605",     # 2 planets, V=8.7
+        "HD 43848",     # giant planet, V=8.1
+        "HD 45652",     # hot Jupiter, V=8.1
+        "HD 46375",     # hot Saturn, V=7.9
+        "HD 66428",     # giant planet, V=8.3
+        "HD 70642",     # Jupiter in HZ, V=7.2
+        "HD 80606",     # very eccentric hot Jupiter, V=9.0
+        "HD 81040",     # planet b, V=7.6
+        "HD 83443",     # hot Jupiter, V=8.2
+        "HD 88133",     # hot Jupiter, V=8.0
+        "HD 93083",     # planet b, V=8.3
+        "HD 97658",     # super-Earth, V=7.7
+        "HD 99109",     # planet b, V=9.1
+        "HD 99492",     # Saturn in HZ, V=7.6
+        "HD 99706",     # giant planet, V=8.1
+        "HD 100777",    # planet b, V=8.4
+        "HD 101930",    # planet b, V=8.2
+        "HD 102117",    # super-Earth, V=7.5
+        "HD 106252",    # eccentric giant, V=7.4
+        "HD 107148",    # planet b, V=8.0
+        "HD 111232",    # eccentric Jupiter, V=7.6
+        "HD 116029",    # planet b, V=8.0
+        "HD 118203",    # hot Jupiter, V=8.1
+        "HD 121504",    # hot Jupiter, V=7.5
+        "HD 125612",    # 3 planets, V=8.3
+        "HD 130322",    # hot Jupiter, V=8.0
+        "HD 131496",    # planet b, V=8.1
+        "HD 132406",    # eccentric giant, V=8.4
+        "HD 140913",    # near-brown-dwarf, V=8.1
+        "HD 141937",    # eccentric giant, V=7.2
+        "HD 153950",    # giant planet, V=7.4
+        "HD 156279",    # near-brown-dwarf, V=8.0
+        "HD 162020",    # BD companion, V=9.2
+        "HD 163607",    # 2 giant planets, V=8.0
+        "HD 168746",    # planet b, V=7.9
+        "HD 170469",    # Saturn analog, V=8.2
+        "HD 175167",    # eccentric giant, V=8.0
+        "HD 178911 B",  # hot Jupiter in triple system
+        "HD 181433",    # 3 planets including HZ, V=9.0
+        "HD 181720",    # planet b, V=7.8
+        "HD 187085",    # planet b, V=7.2
+        "HD 187123",    # hot Jupiter + cold companion, V=7.9
+        "HD 190647",    # planet b, V=7.8
+        "HD 195019",    # giant planet, V=7.3
+        "HD 204941",    # planet b, V=8.7
+        "HD 205739",    # planet b, V=8.6
+        "HD 207077",    # planet b, V=8.1
+        "HD 208487",    # planet b, V=7.5
+        "HD 212301",    # hot Jupiter, V=7.8
+        "HD 218566",    # planet b, V=8.6
+        "HD 220842",    # hot Jupiter, V=7.6
+        "HD 221287",    # eccentric giant, V=7.8
+        # additional M-dwarf hosts
+        "GJ 649",       # Saturn-mass M-dwarf
+        "GJ 674",       # super-Earth M-dwarf
+        "GJ 3021",      # Jupiter analog M-dwarf
+        # miscellaneous confirmed hosts
+        "HD 4113",      # eccentric giant, V=7.9
+        "HD 13908",     # 2 planets, V=7.5
     ]
     BAND             = "1w"
+    TRAINING_BANDS   = ["1w", 1, 3, 4]   # all bands for training data diversity
     CONTRAST         = "high"
     ANALYSIS_START   = "2026-12-01T00:00:00"
-    ANALYSIS_DAYS    = 365
-    ALLOWED_GRADES   = ["A", "B"]
+    ANALYSIS_DAYS    = 548                # 18 months — Roman primary mission window
+    ALLOWED_GRADES   = ["A", "B", "C"]
     SORT_MODE        = "closest_mag"
 
     SCRIPT_START = time.perf_counter()
@@ -1984,8 +2175,9 @@ if __name__ == "__main__":
         STEP_TIMES[label] = elapsed
         print(f"  --> {label} done in {elapsed:.2f}s  {_ts()}")
 
+    print(f"Loading catalog ...  {_ts()}", flush=True)
     catalog = load_catalog()
-    print(f"\nCatalog ready: {len(catalog)} reference stars.  {_ts()}\n")
+    print(f"\nCatalog ready: {len(catalog)} reference stars.  {_ts()}\n", flush=True)
 
     t_s0 = _step_start("STEP 0: Catalog diagnostics + finding benchmark target")
     print_catalog_diagnostics(catalog, BAND, CONTRAST, ALLOWED_GRADES)
@@ -2029,25 +2221,26 @@ if __name__ == "__main__":
     print(f"\n  Benchmark: target={SCIENCE_TARGET} | "
           f"pitch<={MAX_PITCH} deg | contrast={CONTRAST}\n")
 
-    # ── Step 1: generate training data (parallel) ──────────────────────────────
+    # Step 1: generate training data (parallel) 
     t_s1     = _step_start("STEP 1: Generating training data (parallel)")
     examples = generate_training_data(
         TRAINING_TARGETS, ANALYSIS_START, ANALYSIS_DAYS,
-        BAND, catalog, ALLOWED_GRADES, MAX_PITCH,
+        TRAINING_BANDS, catalog, ALLOWED_GRADES, MAX_PITCH,
     )
     _step_done("STEP 1", t_s1)
 
     if not examples:
         raise RuntimeError("No training examples generated — check Step 0 output.")
 
-    # ── Step 2: train classifier ───────────────────────────────────────────────
+    # Step 2: train classifier 
     t_s2 = _step_start("STEP 2: Training classifier")
+    _nw = 0 if platform.system() == "Windows" else 4
     model, threshold, train_losses = train_classifier(
-        examples, num_workers=4, use_amp=True, return_history=True
+        examples, num_workers=_nw, use_amp=True, return_history=True
     )
     _step_done("STEP 2", t_s2)
 
-    # ── Step 3a: baseline (no ML filter) ──────────────────────────────────────
+    # Step 3a: baseline (no ML filter) 
     t_s3a        = _step_start("STEP 3a: Baseline (no ML filter)")
     t2           = time.perf_counter()
     result_base  = select_ref_star(
@@ -2062,7 +2255,7 @@ if __name__ == "__main__":
     print(f"  Wall-clock: {base_time:.2f}s | valid stars found: {n_base_stars}")
     _step_done("STEP 3a", t_s3a)
 
-    # ── Step 3b: ML-accelerated ────────────────────────────────────────────────
+    # Step 3b: ML-accelerated 
     t_s3b     = _step_start("STEP 3b: ML-accelerated")
     t3        = time.perf_counter()
     result_ml = select_ref_star(
@@ -2081,7 +2274,7 @@ if __name__ == "__main__":
     print(f"  Speedup: {base_time/ml_time:.2f}x")
     _step_done("STEP 3b", t_s3b)
 
-    # ── Recall check ───────────────────────────────────────────────────────────
+    # Recall check 
     t_src  = _step_start("RECALL CHECK")
     all_ok = True
     for i, (wb, wm) in enumerate(zip(
@@ -2091,17 +2284,18 @@ if __name__ == "__main__":
         sb     = {r["reference_star"] for r in wb["valid_refs"]}
         sm     = {r["reference_star"] for r in wm["valid_refs"]}
         missed = sb - sm
-        ok     = not missed
+        miss_rate = len(missed) / max(1, len(sb))
+        ok     = miss_rate <= 0.01  # ≤1% miss acceptable at 99% recall target
         all_ok = all_ok and ok
         print(f"  Window {i+1}: baseline={len(sb)} | ML={len(sm)} | "
-              f"missed={len(missed)} "
-              f"({'RECALL=1.0 OK' if ok else 'MISSED: ' + str(missed)})")
+              f"missed={len(missed)} ({miss_rate:.1%}) "
+              f"({'OK' if ok else 'MISSED: ' + str(missed)})")
 
     print(f"\n  Overall: "
-          f"{'RECALL=1.0 across all windows' if all_ok else 'WARNING: recall < 1.0'}")
+          f"{'≥99% recall across all windows' if all_ok else 'WARNING: recall < 99%'}")
     _step_done("RECALL CHECK", t_src)
 
-    # ── Step 4: multi-target parallel benchmark ────────────────────────────────
+    # Step 4: multi-target parallel benchmark 
     t_s4 = _step_start("STEP 4: Multi-target parallel benchmark")
 
     BENCHMARK_TARGETS = [t for t in TRAINING_TARGETS if t != SCIENCE_TARGET]
@@ -2130,7 +2324,7 @@ if __name__ == "__main__":
 
     print_multi_target_summary(multi_results)
 
-    # ── Per-target detailed results ────────────────────────────────────────────
+    # Per-target detailed results 
     print("\n" + "=" * 60)
     print("PER-TARGET DETAILED RESULTS")
     print("=" * 60)
@@ -2153,7 +2347,7 @@ if __name__ == "__main__":
             print(f"    Window {i+1}: {win['start'][:10]} → {win['end'][:10]} "
                   f"| {n} valid star(s) | best: {best_str}")
 
-    # ── Step 5: efficiency graphs ──────────────────────────────────────────────
+    # Step 5: efficiency graphs
     t_s5 = _step_start("STEP 5: Efficiency Graphs")
 
     print("\n[5a] Statistical efficiency figure...")
@@ -2177,8 +2371,6 @@ if __name__ == "__main__":
     print(f"  [5d done in {time.perf_counter()-t_5d:.1f}s]  {_ts()}")
 
     _step_done("STEP 5", t_s5)
-
-    # ── Final summary ──────────────────────────────────────────────────────────
     total = time.perf_counter() - SCRIPT_START
     print(f"\n{'='*60}")
     print(f"  ALL DONE  {_ts()}")
